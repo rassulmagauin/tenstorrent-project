@@ -14,6 +14,12 @@
 \usepackage{subcaption}
 \usepackage{balance}
 
+%% Give TeX more wiggle room to avoid overfull hbox in narrow columns
+%% (the tt-metal paths and underscored identifiers are long).
+\emergencystretch=5em
+\hbadness=10000
+\tolerance=2000
+
 %% ---- Metadata (stripped by nonacm, but kept for completeness) -----------
 \acmConference[ASPLOS '26]{31st International Conference on Architectural
   Support for Programming Languages and Operating Systems}{March 22--26,
@@ -107,8 +113,8 @@ shares its base transformer with Qwen2.5-7B-Instruct. Both have 28
 layers, hidden size 3584, MLP intermediate size 18944, 28 query heads
 with 4 grouped key/value heads, and \texttt{rope\_theta} $=10^{6}$.
 This matters for us because \texttt{tt-metal} already ships a tuned
-\texttt{performance\_decoder\_config.json} for Qwen2.5-7B, and we can
-reuse it directly.
+performance decoder config for Qwen2.5-7B, and we can reuse it
+directly.
 
 \paragraph{Fusion in \texttt{tt-metal}.}
 \texttt{tt-metal} does not fuse kernels by writing one monolithic
@@ -128,20 +134,20 @@ update.
 with \texttt{ENABLE\_TRACY=ON}.
 
 \paragraph{Workload.} We drive the canonical
-\texttt{models/tt\_transformers/demo/simple\_text\_demo.py} benchmark in
-decode mode, batch~1, with a 1024-token context, 10 transformer layers,
-paged attention on, and the stock
-\texttt{performance\_decoder\_config.json}. The \texttt{blackhole-4}
-pytest fixture picks a 4-way tensor-parallel mesh for us. Weights are
-local \texttt{bf16} safetensors downloaded from Hugging Face.
+\texttt{simple\_text\_demo.py} benchmark from
+\texttt{tt\_transformers} in decode mode: batch~1, 1024-token context,
+10 transformer layers, paged attention on, and the stock
+performance decoder config. The \texttt{blackhole-4} pytest fixture
+picks a 4-way tensor-parallel mesh for us. Weights are local
+\texttt{bf16} safetensors downloaded from Hugging Face.
 
 \paragraph{Profiling.} We wrap the pytest invocation in
 \texttt{python -m tracy} with the \texttt{device\_kernel\_duration}
-analysis turned on. That writes a per-op CSV under
-\texttt{generated/profiler/reports/.../ops\_perf\_results\_*.csv},
-which for our 10-layer run contained 4{,}916 rows across two
-trace-replay sessions (compile phase excluded). We process the CSV two
-ways. First, a small pandas script for per-op aggregates. Second,
+analysis turned on. That writes a per-op CSV under the profiler
+reports directory (\texttt{ops\_perf\_results\_*.csv}), which for our
+10-layer run contained 4{,}916 rows across two trace-replay sessions
+(compile phase excluded). We process the CSV two ways. First, a small
+pandas script for per-op aggregates. Second,
 \texttt{tt-perf-report}~v1.2.2~\cite{ttperfreport}, which gives us a
 stacked per-op-class view and, more usefully for us, math-fidelity
 annotations.
@@ -212,8 +218,8 @@ at HiFi4 math fidelity on BF16/BFP8 operands.
 The fused SDPA-decode kernel, the head reshapes, RoPE, and the
 KV-cache update together add up to only 1.3\% of per-iter kernel time.
 We take this as a good sign: the flash-attention-style CB choreography
-in \texttt{ttnn/cpp/ttnn/operations/transformer/sdpa/} is already doing
-its job. We do not plan to touch attention.
+already shipped under \texttt{ttnn/.../transformer/sdpa/} is doing its
+job. We do not plan to touch attention.
 
 \paragraph{Tensor-parallel overhead is small but present.}
 AllGather plus ReduceScatter together add up to 5.7\%. This is headroom
@@ -239,8 +245,8 @@ HiFi2 mode that trades the lowest activation bit for about a
 biggest single-line change available against the stock recipe. We
 expect it to cut the MLP slice by up to half, which is around
 1.9~ms/iter, or roughly 15\% of the TopK-excluded kernel budget. The
-change is one field in \texttt{performance\_decoder\_config.json}. The
-main risk is an accuracy regression, so we will run the in-tree
+change is one field in the performance decoder config. The main risk
+is an accuracy regression, so we will run the in-tree
 \texttt{ci-token-matching} parameterization against a HiFi4 reference
 to verify that output tokens still match.
 

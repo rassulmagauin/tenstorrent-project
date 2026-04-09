@@ -1,0 +1,303 @@
+%% ASPLOS 2026 submission template
+%% Class:  acmart (sigplan proceedings)
+%% Per ASPLOS'26 CFP: \documentclass[sigplan,nonacm]{acmart}
+%% Body text 10pt. Page numbers enabled via \settopmatter{printfolios=true}.
+%% Bibliography: ACM-Reference-Format.
+%% This is the Project Checkpoint document (2--3 pages).
+
+\documentclass[sigplan,nonacm,review]{acmart}
+
+\settopmatter{printfolios=true,printccs=false,printacmref=false}
+
+%% ---- Packages -----------------------------------------------------------
+\usepackage{booktabs}
+\usepackage{subcaption}
+\usepackage{balance}
+
+%% ---- Metadata (stripped by nonacm, but kept for completeness) -----------
+\acmConference[ASPLOS '26]{31st International Conference on Architectural
+  Support for Programming Languages and Operating Systems}{March 22--26,
+  2026}{Pittsburgh, PA, USA}
+
+%% ---- Title --------------------------------------------------------------
+\title{Optimizing Qwen2.5-Coder Inference on Tenstorrent Blackhole:\\
+       Project Checkpoint}
+
+\author{Rassul Magauin}
+\author{Assylzhan Khamiyev}
+\author{Mohammed Rashed Ali Yahmoor Alshehhi}
+\author{Sultan Akimaliyev}
+\affiliation{%
+  \institution{Mohamed bin Zayed University of Artificial Intelligence}
+  \city{Abu Dhabi}\country{UAE}}
+
+\renewcommand{\shortauthors}{Magauin et al.}
+
+%% ---- Abstract -----------------------------------------------------------
+\begin{abstract}
+We report the first checkpoint of an inference optimization study of
+Qwen2.5-Coder on the Tenstorrent Blackhole~p150 accelerator using the
+\texttt{tt-metal} SDK. Starting from the in-tree \texttt{tt\_transformers}
+port with the stock Blackhole tuning recipe, we establish a device-level
+decode baseline on a four-device tensor-parallel mesh, identify the
+dominant kernels via the Tracy device profiler and the
+\texttt{tt-perf-report} utility recommended by the course staff, and rank
+three concrete optimization targets by projected return on engineering
+effort. Our measurements reveal that (i)~the sampling-stage TopK operator
+accounts for 45--60\% of per-token device kernel time but executes on a
+single Tensix core out of 130---an under-utilization artifact rather than
+a model bottleneck; (ii)~the MLP feed-forward block is the largest
+\emph{real} bottleneck at $\sim$31\% of device time, dominated by the
+gate/up and down projections; and (iii)~the fused scaled-dot-product
+attention kernel is negligible ($<$1.5\%), validating that existing
+flash-attention-style fusions on Blackhole already perform as intended.
+We propose parallelizing TopK, switching the MLP matmuls from HiFi4 to
+HiFi2 math fidelity, and fusing the gate/up projections as our next
+steps.
+\end{abstract}
+
+\begin{document}
+\maketitle
+
+%% =========================================================================
+\section{Introduction and Goals}
+%% =========================================================================
+Large language models tailored to code---such as Qwen2.5-Coder~\cite{qwen25coder}---are
+increasingly deployed on non-GPU accelerators. Tenstorrent's Blackhole
+p150 is an open-architecture, RISC-V-based tensor processor whose 130
+worker Tensix cores each expose a matrix unit (FPU), a vector unit
+(SFPU), five Baby RISC-V CPUs, and 1.5~MB of L1 SRAM connected by a
+2D NoC~\cite{ttmetal}. Unlike GPU stacks, \texttt{tt-metal} exposes
+kernels, circular buffers, and NoC scheduling directly to the developer,
+which creates both an optimization opportunity and a steep perf-debugging
+curve.
+
+\paragraph{Project direction.}
+Following the teaching staff's redirect, we pursue \emph{Direction~B:
+Optimization}: we take the already-ported \texttt{tt\_transformers}
+implementation of Qwen2.5 as a starting point and measure, rank, and
+remove bottlenecks specific to Blackhole. A from-scratch port was
+rejected because \texttt{tt\_transformers} already supports the Qwen2.5
+family.
+
+\paragraph{Contributions of this checkpoint.}
+\begin{enumerate}
+  \item A reproducible device-level profiling pipeline for
+        \texttt{tt\_transformers} decode on a four-device Blackhole mesh,
+        combining the Tracy profiler with the \texttt{tt-perf-report}
+        utility recommended by TA Dongning Ma.
+  \item A per-operator breakdown of Qwen2.5-Coder-7B-Instruct decode
+        against the stock tuned recipe, distinguishing
+        under-utilization artifacts (TopK) from real model bottlenecks
+        (MLP).
+  \item A ranked list of three concrete, Blackhole-aware optimization
+        targets with projected first-order ROI, to be executed and
+        measured before the final report.
+\end{enumerate}
+
+%% =========================================================================
+\section{Background}
+%% =========================================================================
+\paragraph{Blackhole p150.}
+Blackhole exposes an $8{\times}10$ compute grid (130 worker cores
+visible to \texttt{tt-metal}, compared to Wormhole's $8{\times}8$),
+1.5~MB of L1 per core, and eight DRAM banks. The in-tree
+\texttt{tt\_transformers} framework gates several Blackhole-specific
+paths via \texttt{is\_blackhole()}, most notably \texttt{prefill\_len\_cutoff}
+$=\!512$ (vs.\ 1024 on Wormhole) and a Blackhole-only DRAM weight
+prefetcher currently wired for Llama-3.1-8B.
+
+\paragraph{Qwen2.5-Coder-7B-Instruct.}
+Qwen2.5-Coder-7B shares its base transformer with
+Qwen2.5-7B-Instruct: 28 layers, hidden size 3584, MLP intermediate
+18944, 28 query heads with 4 grouped key/value heads, and
+\texttt{rope\_theta} $=10^{6}$. This architectural parity lets us use
+the \texttt{performance\_decoder\_config.json} tuning recipe that
+\texttt{tt-metal} already ships for Qwen2.5-7B.
+
+\paragraph{Fusion model of \texttt{tt-metal}.}
+\texttt{tt-metal} fuses via circular-buffer choreography rather than
+monolithic kernels. A \emph{reader} kernel streams tiles from DRAM or a
+neighbor core's L1 into L1 circular buffers; a \emph{compute} kernel
+drains them through the FPU/SFPU; and a \emph{writer} kernel streams
+results out. Fusion is then a property of the CB topology, not a single
+file. We rely on five canonical fusion patterns already present in
+tt-metal: fused SDPA, matmul$+$bias$+$activation, distributed RMSNorm,
+async AllGather$+$matmul, and paged KV-cache update.
+
+%% =========================================================================
+\section{Methodology}
+%% =========================================================================
+\paragraph{Hardware.} One machine with four Blackhole p150 devices at
+\texttt{/dev/tenstorrent/\{0..3\}}, running \texttt{tt-metal}
+built with \texttt{ENABLE\_TRACY=ON}.
+
+\paragraph{Workload.} We drive the canonical
+\texttt{models/tt\_transformers/demo/simple\_text\_demo.py} benchmark:
+decode mode, batch~1, 1024-token context, 10 transformer layers, paged
+attention on, and the stock
+\texttt{performance\_decoder\_config.json}. The \texttt{blackhole-4}
+pytest fixture auto-selects a 4-way tensor-parallel mesh. Weights are
+local \texttt{bf16} safetensors downloaded from Hugging Face.
+
+\paragraph{Profiling pipeline.} We wrap the pytest invocation with
+\texttt{python -m tracy -p -r -a device\_kernel\_duration}, which emits
+a per-op CSV under
+\texttt{generated/profiler/reports/.../ops\_perf\_results\_*.csv}
+(4{,}916 rows across two trace-replay sessions, compile phase
+excluded). We post-process the CSV with two complementary tools: a
+small pandas script for per-op aggregates, and the
+\texttt{tt-perf-report}~v1.2.2 utility distributed as a separate
+repository~\cite{ttperfreport} (explicitly requested by our TA) for
+stacked per-op-class breakdowns and math-fidelity analysis.
+
+%% =========================================================================
+\section{Baseline Results}
+%% =========================================================================
+Table~\ref{tab:baseline} reports the per-iteration device-kernel-time
+breakdown for Qwen2.5-Coder-7B-Instruct decode on a four-way Blackhole
+tensor-parallel mesh (device~0, steady-state trace replay, compile
+phase excluded). Total per-decode-iteration device kernel time is
+\textbf{12.1~ms} on the 7B-Instruct run and 10.4~ms on the Coder-7B
+run; the absolute delta is attributable to compile-cache warm-up
+between back-to-back runs (op counts and shapes are bit-identical, and
+the TopK kernel time matches to the nanosecond), so the
+\emph{qualitative} ranking is robust across runs.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Per-iteration device-0 kernel time, Qwen2.5-Coder-7B-Instruct
+  decode, 4-way Blackhole TP mesh, 10 layers, stock tuned recipe.
+  TopK is a sampling-stage op, not a transformer-layer op.}
+\label{tab:baseline}
+\begin{tabular}{lrr}
+\toprule
+Operator / group & Time (ms) & \% of total \\
+\midrule
+TopK (sampling, 1-core)          & 5.48 & 45.3 \\
+MLP gate$+$up projections        & 2.41 & 19.9 \\
+MLP down projection              & 1.40 & 11.5 \\
+Attention QKV projections        & 1.03 &  8.5 \\
+CCL (AllGather $+$ ReduceScatter)& 0.69 &  5.7 \\
+Layout/tiling/eltwise glue       & 0.46 &  3.8 \\
+Attention output projection      & 0.28 &  2.3 \\
+Fused SDPA decode $+$ RoPE       & 0.15 &  1.3 \\
+RMSNorm                          & 0.13 &  1.1 \\
+Other                            & 0.08 &  0.6 \\
+\midrule
+\textbf{Total per iter.}         & \textbf{12.11} & \textbf{100.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% =========================================================================
+\section{Bottleneck Analysis}
+%% =========================================================================
+\paragraph{TopK is an under-utilization artifact, not a layer bug.}
+\texttt{TopKDeviceOperation} consumes 45--60\% of per-token device
+kernel time across both profiled runs, with a shape of
+$[1,1,32,38016]$ and $k{=}32$. The kernel runs on a \emph{single}
+Tensix core out of the 130 available on Blackhole. This is not a
+transformer-layer bottleneck---it is a sampling-stage mapping bug that
+an existing multi-core reduction template should be able to remove
+nearly in full. We treat it as the highest-ROI, lowest-risk item on
+the list.
+
+\paragraph{The MLP block is the real hot path.}
+Excluding TopK, the MLP feed-forward block accounts for
+$\sim$31\% of device kernel time ($\approx$3.81~ms/iter), split
+between the gate/up projections ($3584 \!\to\! 5120$, 20 calls/iter)
+and the down projection ($5120 \!\to\! 3584$). The single slowest
+individual op is the down projection at 139.8~$\mu$s
+max. Per the tt-metal model-config database, these matmuls currently
+run in HiFi4 math fidelity on BF16/BFP8 operands.
+
+\paragraph{Attention is already fused and cheap.}
+The fused SDPA-decode kernel, head reshapes, RoPE, and KV-cache update
+together contribute only 1.3\% of per-iter kernel time. This confirms
+that the flash-attention-style CB choreography in
+\texttt{ttnn/cpp/ttnn/operations/transformer/sdpa/} is already doing
+what we would hope; attention is explicitly \emph{not} a target.
+
+\paragraph{Tensor-parallel overhead is modest.}
+AllGather plus ReduceScatter (the TP tax) accounts for 5.7\%. This is
+headroom worth chasing only after the MLP wins are realized.
+
+%% =========================================================================
+\section{Planned Optimizations and Projected ROI}
+%% =========================================================================
+We rank three candidates by (a)~projected kernel-time recovery and
+(b)~engineering effort.
+
+\begin{enumerate}
+\item \textbf{Parallelize / fuse TopK.} Move \texttt{TopKDeviceOperation}
+      off a single core onto a multi-core reduction template, or fuse
+      it directly into \texttt{SamplingDeviceOperation}. Projected
+      recovery: most of the 45--60\% TopK slice. Effort:
+      \emph{low}---this is a dispatch-and-shard problem, not a new
+      kernel. (Per-layer scaling: frees time regardless of layer
+      count, since sampling is per-token.)
+\item \textbf{HiFi4 $\to$ HiFi2 for MLP matmuls.} The Blackhole FPU
+      exposes a HiFi2 math-fidelity mode that trades the lowest
+      activation bit for roughly 2$\times$ matmul throughput. The
+      \texttt{tt-perf-report} tool flagged this as the highest-impact
+      single-line change available against the stock recipe.
+      Projected recovery: up to half of the $\sim$3.8~ms MLP slice
+      ($\approx$1.9~ms/iter, $\approx$15\% of TopK-excluded kernel
+      time). Effort: \emph{very low}---one field in
+      \texttt{performance\_decoder\_config.json}. Risk: must verify
+      with \texttt{ci-token-matching} that end-to-end generation
+      quality is preserved.
+\item \textbf{Fuse MLP gate$+$up projections.} Merge the two
+      $3584\!\to\!5120$ projections into one $3584\!\to\!10240$ matmul,
+      halving dispatch overhead and activation round-trips. Projected
+      recovery: the second-largest slice after HiFi2. Effort:
+      \emph{medium}---requires checking whether the stock config
+      already enables this and, if not, a model-code edit plus a
+      perf/accuracy re-run.
+\end{enumerate}
+
+%% =========================================================================
+\section{Roadblocks and Risks}
+%% =========================================================================
+\paragraph{Hardware monitoring.} \texttt{tt-smi} is not installed on our
+box; we confirm device health via first-program-launch runtime logs.
+Installing \texttt{tt-smi} is a next step.
+
+\paragraph{Compile-cache variance.} Back-to-back runs of architecturally
+identical models showed a $\sim$44\% per-op difference in Matmul mean
+time, attributable to compile-cache state. We will rerun each
+optimization experiment from a clean cache and report matched-cache
+deltas.
+
+\paragraph{Accuracy regression from HiFi2.} HiFi2 drops the lowest
+activation mantissa bit. We will gate the change behind the in-tree
+\texttt{ci-token-matching} parameterization and report token-match
+rates against the HiFi4 reference.
+
+\paragraph{Coder-specific validation.} Since Qwen2.5-Coder-7B is
+architecturally identical to Qwen2.5-7B-Instruct, our ``Coder-ness''
+must be demonstrated at the accuracy/output level (code-generation
+prompts), not at the kernel level. We will include a small
+code-completion token-match check in the final report.
+
+%% =========================================================================
+\section{Next Steps}
+%% =========================================================================
+Between now and the final report we will:
+(1)~land the TopK multi-core fix and re-profile;
+(2)~measure HiFi2 MLP speedup and verify token-match rate;
+(3)~evaluate MLP gate$+$up fusion;
+(4)~characterize single-device (non-TP) decode to isolate CCL
+overhead; and
+(5)~profile prefill in addition to decode, since the Blackhole
+prefill-length cutoff of 512 tokens may expose a distinct set of
+hot paths.
+
+%% =========================================================================
+\balance
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+
+\end{document}

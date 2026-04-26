@@ -48,20 +48,17 @@ began by profiling the existing \texttt{tt\_transformers} port of
 Qwen2.5 with the stock Blackhole tuning recipe on a four-device
 tensor-parallel mesh. Two things surprised us. First, the single
 largest kernel in the profile is TopK at 45--60\% of per-token device
-kernel time, but it only runs on one of the 130 Tensix cores. After
-reading the tt-metal source, the cause turned out to be a power-of-two
-width requirement in the multi-core TopK path, which our 38016-wide
-per-device vocab does not satisfy. Second, the fused SDPA kernel is
-already very cheap (under 1.5\%), which tells us attention is not
-where we should be spending effort. Once TopK is set aside, the MLP
-feed-forward block is the real hot path at about 31\% of kernel time,
-with the gate/up and down projections doing most of the work. Based on
-this, we plan three changes: pad the per-device vocab to the next
-power of two so the existing multi-core TopK kernel actually fires,
-drop the MLP matmuls from HiFi4 to HiFi2 math fidelity for a 2x matmul
-throughput win, and fuse the gate and up projections into one wide
-matmul. We report baseline numbers, the verified status of each
-target, and the roadblocks we ran into along the way.
+kernel time, but it runs on only one of the 130 Tensix cores, so it is
+really a sampling-stage mapping bug rather than a layer bottleneck.
+Second, the fused SDPA kernel is already very cheap (under 1.5\%),
+which tells us attention is not where we should be spending effort.
+Once TopK is set aside, the MLP feed-forward block is the real hot
+path at about 31\% of kernel time, with the gate/up and down
+projections doing most of the work. Based on this, we plan to
+parallelize TopK, try dropping the MLP matmuls from HiFi4 to HiFi2
+math fidelity, and fuse the gate and up projections into one wide
+matmul. We report baseline numbers, ranked targets, and the roadblocks
+we ran into along the way.
 \end{abstract}
 
 \begin{document}
@@ -198,21 +195,15 @@ Other                            & 0.08 &  0.6 \\
 %% =========================================================================
 \section{Bottleneck Analysis}
 %% =========================================================================
-\paragraph{TopK is a sampling-stage dispatch problem, not a layer bug.}
+\paragraph{TopK is a sampling-stage bug, not a layer bottleneck.}
 \texttt{TopKDeviceOperation} takes 45--60\% of per-token device kernel
 time, with input shape $[1,1,32,38016]$ and $k{=}32$. What makes this
 strange is that the kernel only runs on a single Tensix core, out of
-the 130 that Blackhole exposes. After reading the source, we found out
-why: a multi-core TopK kernel does exist (under
-\texttt{ttnn/.../reduction/topk/}), but its dispatch logic in
-\texttt{topk\_device\_operation.cpp} requires the input width to be a
-power of two, because the underlying compute kernel uses a Batcher
-bitonic sort. Our per-device vocab width is $38016 = 152064 / 4$
-(Qwen2.5's vocab split over the 4-way TP mesh), which is not a power
-of two, so the dispatcher silently falls back to the single-core
-path. This is not a transformer-layer issue, and not really a kernel
-bug either. It is a vocab-shape mismatch with the multi-core fast
-path.
+the 130 that Blackhole exposes. So it is not really a transformer-layer
+issue at all. It is a sampling-stage mapping bug, and an existing
+multi-core reduction template should remove most of it. Of the three
+things we are planning to try, this one looks the easiest and carries
+the least risk, so we want to do it first.
 
 \paragraph{The MLP block is where the real time goes.}
 Once TopK is set aside, the MLP feed-forward block is the hot path:
@@ -239,19 +230,14 @@ we could claim later, but only after the MLP wins are in.
 \label{sec:opts}
 %% =========================================================================
 
-\paragraph{Pad the vocab so multi-core TopK can fire.} The
-multi-core TopK kernel already exists. To make our shape eligible, we
-pad the per-device vocab from 38016 up to the next power of two
-(65536) inside the sampling step, run multi-core TopK on the padded
-buffer, and discard the dummy entries afterward. This is the same
-workaround the upstream tt-metal team has applied for other models in
-recent commits, so the precedent is set. The change is small, lives
-entirely in the sampling code, and does not require touching any
-kernel. Because sampling runs once per generated token, the speedup
-applies to decode regardless of how many layers the model has. The
-main risk is that the merge step in multi-core TopK becomes the new
-bottleneck. If that happens, our fallback is to drop $k$ from 32 to
-16, which halves the gather volume.
+\paragraph{Parallelize or fuse TopK.} Moving
+\texttt{TopKDeviceOperation} off a single core onto a multi-core
+reduction, or fusing it straight into
+\texttt{SamplingDeviceOperation}, should give us most of the 45--60\%
+TopK slice back. The effort looks low: this is mostly a dispatch and
+sharding question, not a new kernel. Because sampling happens
+once per generated token, any speedup here applies to decode regardless
+of how many layers the model has.
 
 \paragraph{HiFi4 $\to$ HiFi2 for the MLP matmuls.} Blackhole's FPU has a
 HiFi2 mode that trades the lowest activation bit for about a
@@ -264,22 +250,13 @@ is an accuracy regression, so we will run the in-tree
 \texttt{ci-token-matching} parameterization against a HiFi4 reference
 to verify that output tokens still match.
 
-\paragraph{Fuse the MLP gate and up projections.} We checked
-\texttt{tt\_transformers/tt/mlp.py} and confirmed that for Qwen2.5 the
-gate (\texttt{w1}) and up (\texttt{w3}) projections are still issued
-as two separate \texttt{ttnn.linear} calls per layer. Our profile
-agrees: 20 gate${+}$up matmuls across 10 layers, two per layer.
-Interestingly, the framework already has the scaffolding for the
-fused form: \texttt{load\_checkpoints.py} defines a
-\texttt{fuse\_mlp\_meta} helper that concatenates the two weight
-tensors into a single \texttt{w1\_w3}, and the Llama-Meta path uses
-it. It is just not wired up for Qwen. Our plan is to (i) concatenate
-the gate and up weights at load time using the same helper, (ii)
-modify the Qwen MLP class to load \texttt{w1\_w3} instead of
-\texttt{w1} and \texttt{w3}, and (iii) replace the two \texttt{ttnn.linear}
-calls with a single $3584 \!\to\! 10240$ matmul whose output we split
-in half before applying SwiGLU. This halves dispatch overhead and
-removes one round-trip through activation memory.
+\paragraph{Fuse the MLP gate and up projections.} Merging the two
+$3584 \!\to\! 5120$ projections into one $3584 \!\to\! 10240$ matmul
+halves dispatch overhead and cuts one round-trip through activation
+memory. We still need to check whether the stock config does this
+already. If it does not, the fix is a small model-code edit followed by
+another perf and accuracy run. This is the biggest remaining win after
+TopK and HiFi2.
 
 %% =========================================================================
 \section{Roadblocks and Open Questions}

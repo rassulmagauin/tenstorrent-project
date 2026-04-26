@@ -1,0 +1,479 @@
+%% ASPLOS 2026 project — final presentation
+%% Beamer slides, ~15 min talk (35% of grade).
+
+\documentclass[aspectratio=169,10pt]{beamer}
+
+\usetheme{metropolis}
+\usepackage{booktabs}
+\usepackage{appendixnumberbeamer}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=none,
+  xleftmargin=0.5em,
+  numbers=none
+}
+
+\setbeamertemplate{frame footer}{Qwen2.5-Coder on Blackhole \textbullet{} MBZUAI}
+
+\title{Optimizing Qwen2.5-Coder Decode on Tenstorrent Blackhole}
+\subtitle{Two Wins, One Dead End, and What We Learned}
+
+\author{Rassul Magauin \and Assylzhan Khamiyev \and \\
+        Mohammed Rashed Ali Yahmoor Alshehhi \and \\
+        Sultan Akimaliyev \and Hamad Khalifa Alyahyaee}
+
+\institute{Mohamed bin Zayed University of Artificial Intelligence \\
+           AI Systems --- Prof.\ Abdulrahman Mahmoud}
+
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Where we started}
+  \textbf{Direction B --- optimization.} Take Qwen2.5-Coder on
+  Tenstorrent Blackhole and make it faster.
+  \vfill
+  \begin{itemize}
+    \item Base: \texttt{tt\_transformers} already supports the Qwen2.5
+          family.
+    \item Hardware: 4$\times$ Blackhole p150 in tensor-parallel mesh.
+    \item Method: profile, rank, fix, re-profile. Repeat three times.
+  \end{itemize}
+  \vfill
+  \begin{alertblock}{Spoiler}
+    We tried three optimizations. Two worked. One made the model
+    \emph{slower}. The failure is the most interesting result.
+  \end{alertblock}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\section{The Machine}
+
+\begin{frame}{Blackhole p150 in one slide}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{.55\textwidth}
+      \begin{itemize}
+        \item 130 Tensix cores in an $8{\times}10$ compute grid
+        \item Each core: FPU (matrix), SFPU (vector), 5 RISC-V CPUs,
+              1.5~MB L1 SRAM
+        \item 8 DRAM banks, 2D NoC
+        \item 3 math-fidelity modes:
+          \begin{itemize}
+            \item LoFi — 4 TFLOPS, drops 4 mantissa bits
+            \item HiFi2 — 2 TFLOPS, lossless on BFP8
+            \item HiFi4 — 1 TFLOPS, full BF16
+          \end{itemize}
+      \end{itemize}
+    \end{column}
+    \begin{column}{.45\textwidth}
+      \small
+      \textbf{\texttt{tt-metal} programming model}\\[0.3em]
+      Each op = a program:
+      \begin{itemize}\small
+        \item reader kernel pulls tiles
+        \item compute kernel runs FPU/SFPU
+        \item writer kernel pushes tiles
+      \end{itemize}
+      Circular buffers in L1 stitch them together. Fusion happens at
+      the \emph{pipeline} level, not ``one big kernel''.
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{The workload}
+  \textbf{Qwen2.5-Coder-7B}, architecturally identical to Qwen2.5-7B-Instruct:
+  \begin{itemize}
+    \item 28 decoder layers, hidden 3584, MLP intermediate 18944
+    \item 28 query heads, 4 KV heads (GQA), $\mathrm{rope\_theta}=10^{6}$
+    \item SwiGLU MLP: \texttt{down(silu(gate(x)) * up(x))}
+  \end{itemize}
+  \vfill
+  \textbf{Config we profile:} \\
+  batch 1, 1024-context, 10 decoder layers, paged attention, 2 generated
+  tokens. Tracy profiler with
+  \texttt{-a device\_kernel\_duration}.
+  \vfill
+  \begin{alertblock}{Why 10 layers}
+    Compile time at 28 layers $\sim$6~min per run. At 10 layers we get
+    comparable op-level breakdowns in under 2 minutes and can iterate.
+  \end{alertblock}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\section{Baseline: Where Does the Time Go?}
+
+\begin{frame}{Baseline profile, stock recipe}
+  \small
+  \centering
+  \begin{tabular}{lrrr}
+    \toprule
+    Operator / group & Time (ms) & Calls & \% \\
+    \midrule
+    \alert{TopK (sampling, 1-core)}    & 21.82 &   4 & \alert{52.2} \\
+    \alert{Matmul (all linears)}       & 15.46 & 180 & \alert{37.0} \\
+    ReduceScatter + AllGather (CCL)    &  2.01 & 123 &  4.8 \\
+    BinaryNg (eltwise)                 &  0.69 & 124 &  1.7 \\
+    LayerNorm / RMSNorm                &  0.37 &  63 &  0.9 \\
+    SDPA decode + RoPE + reshapes      &  0.16 &  30 &  0.4 \\
+    Sampling                           &  0.11 &   4 &  0.3 \\
+    Other                              &  1.15 &  -  &  2.7 \\
+    \midrule
+    \textbf{Total}                     & \textbf{41.77} & \textbf{928} & \textbf{100.0} \\
+    \bottomrule
+  \end{tabular}
+  \vfill
+  Qwen2.5-Coder-7B decode, 4-way Blackhole TP, device~0, two trace-replay
+  sessions totalled.
+\end{frame}
+
+\begin{frame}{Two things jump out}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{.48\textwidth}
+      \textbf{TopK at 52\%}\\[0.3em]
+      Only 4 calls (one per generated token). 5.45~ms per call.\\[0.5em]
+      The fused SDPA kernel on 30 calls is \textbf{under half a millisecond} total.\\[0.5em]
+      A single TopK call takes 11$\times$ longer than \emph{all} attention kernels combined.
+    \end{column}
+    \begin{column}{.48\textwidth}
+      \textbf{Matmul at 37\%}\\[0.3em]
+      180 calls. MLP block (FF1+FF2+FF3) is the largest slice.\\[0.5em]
+      Attention (QKV + output proj): $\sim$1.3~ms.\\[0.5em]
+      MLP (gate + up + down): $\sim$3.8~ms.
+    \end{column}
+  \end{columns}
+  \vfill
+  \begin{block}{Plan}
+    Fix TopK first (it is the biggest number). Then tackle the MLP.
+    Leave attention alone --- the fused kernels are already doing
+    their job.
+  \end{block}
+\end{frame}
+
+\begin{frame}[fragile]{The TopK smell test}
+\begin{lstlisting}
+Op: TopKDeviceOperation
+Input shape:   [1, 1, 32, 38016]
+k:             32
+CORE COUNT:    1     <--  one Tensix core out of 130
+DEVICE KERNEL DURATION [ns]:  5,455,012
+\end{lstlisting}
+  \vfill
+  \small
+  \textbf{Input width 38016} = Qwen vocab 152{,}064 / 4 devices.
+  Not a power of two.
+  And \texttt{reduction/topk/} (under \texttt{ttnn/cpp/ttnn/operations/})
+  has a multi-core bitonic sort implementation.\\[0.3em]
+  \textbf{Hypothesis:} pad the per-device vocab up to $65{,}536 = 2^{16}$.
+  Kernel flips to the multi-core path. Done.\\[0.3em]
+  One-line change in \texttt{model\_config.py}. What could go wrong?
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\section{Attempt 1: Pad the Vocab (It Didn't Work)}
+
+\begin{frame}{What we changed}
+  In \texttt{model\_config.py}, replace\\[0.3em]
+  \texttt{self.padded\_vocab\_size = 128 * 1024 if self.is\_galaxy else None}\\[0.3em]
+  with a rule that rounds \emph{per-device} vocab up to the next power of two.
+  For Qwen2.5-7B on 4 devices: $38016 \to 65536$.
+  \vfill
+  The LM head gets a wider output. TopK gets more input, but on a
+  presumed-parallel kernel. Compile, re-profile, celebrate.
+\end{frame}
+
+\begin{frame}{What actually happened}
+  \centering
+  \small
+  \begin{tabular}{lrr}
+    \toprule
+     & Baseline & Padded vocab \\
+    \midrule
+    TopK total time (ms)         & 21.82  & \alert{40.16} \\
+    TopK time per call ($\mu$s)  & 5{,}455 & \alert{10{,}039} \\
+    TopK CORE COUNT              &  1     & \alert{1}     \\
+    Matmul total (ms)            & 15.46  & 11.84         \\
+    (LM head $n$ grew)           &        &               \\
+    \midrule
+    \emph{Total device (ms)}     & \emph{41.77} & \alert{\emph{56.82}} \\
+    \bottomrule
+  \end{tabular}
+  \vfill
+  \textbf{TopK got 84\% slower. End-to-end 36\% slower.}
+\end{frame}
+
+\begin{frame}{Why it failed}
+  The kernel \alert{never switched paths}. CORE COUNT stayed at 1.\\[0.5em]
+  We just fed the same single-core kernel 1.72$\times$ more data.
+  \vfill
+  \begin{block}{Lesson}
+    On \texttt{tt-metal}, kernel dispatch is chosen by the op's
+    \emph{device operation} class based on the full tensor spec ---
+    \textbf{not by input shape alone}.\\[0.5em]
+    ``Round up to a friendlier shape and hope for a faster code path''
+    is a GPU reflex. It does not transfer.
+  \end{block}
+  \vfill
+  \textbf{Reverted} (commit \texttt{f6de95bb02}). Cleared the stale
+  \texttt{output\_lm\_head\_*} tensor cache and re-profiled to confirm.
+\end{frame}
+
+\begin{frame}{What a real TopK fix would take}
+  \begin{itemize}
+    \item Parallelize \texttt{reduction::topk}'s single-core path, or
+    \item Fuse TopK into \texttt{SamplingDeviceOperation}.
+  \end{itemize}
+  \vfill
+  Both are C++ kernel work. Not a Python-level configuration tweak.
+  We filed it as future work and moved on.
+  \vfill
+  \begin{alertblock}{Side observation}
+    The stock Qwen2.5-7B recipe ships with TopK at 45--52\% of per-token
+    device time. \textbf{Every user of this recipe} is paying that tax,
+    not just us.
+  \end{alertblock}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\section{Attempt 2: MLP HiFi4 $\to$ HiFi2}
+
+\begin{frame}[fragile]{Why HiFi2 is free here}
+  \begin{itemize}
+    \item HiFi4 = 1 TFLOPS on BF16, retains full mantissa
+    \item HiFi2 = 2 TFLOPS, drops extra mantissa bits \emph{during the dot product}
+    \item When both operands are BFP8, HiFi2 drops nothing that was there
+  \end{itemize}
+  \vfill
+  Stock \texttt{performance\_decoder\_config.json} for Qwen2.5-7B:
+\begin{lstlisting}
+"LI_FF1_FF3": "HIFI4",
+"LI_FF2":     "HIFI4",
+\end{lstlisting}
+  $\rightarrow$ change both to \texttt{"HIFI2"} in all 28 layers. 56 field edits, otherwise a no-op.
+\end{frame}
+
+\begin{frame}{Result}
+  \centering
+  \small
+  \begin{tabular}{lrrr}
+    \toprule
+     & Baseline & +HiFi2 & $\Delta$ \\
+    \midrule
+    Matmul total (ms)              & 15.46 & \alert{10.45} & \alert{${-}32.4\%$} \\
+    TopK (ms)                      & 21.82 & 21.82 & $0\%$ \\
+    CCL (ms)                       &  2.01 &  2.01 & $0\%$ \\
+    BinaryNg (ms)                  &  0.69 &  0.69 & $0\%$ \\
+    \midrule
+    \emph{Total device (ms)}       & \emph{41.77} & \alert{\emph{36.75}} & \alert{${-}12.0\%$} \\
+    \bottomrule
+  \end{tabular}
+  \vfill
+  \begin{itemize}
+    \item Biggest single win in the project: \textbf{32\% off matmul time}.
+    \item Accuracy: \texttt{ci-token-matching} passes. 2-layer smoke
+          test decodes coherently.
+  \end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\section{Attempt 3: Fuse Gate + Up Projections}
+
+\begin{frame}{The idea}
+  SwiGLU: \texttt{silu(gate\_proj(x)) * up\_proj(x)}
+  \vfill
+  Two matmuls share the same input $x$:
+  \begin{itemize}
+    \item \texttt{gate\_proj}: $[3584] \to [5120]$ per device
+    \item \texttt{up\_proj}:   $[3584] \to [5120]$ per device
+  \end{itemize}
+  Concatenate the weights: single matmul $[3584] \to [10240]$, then slice.
+  \vfill
+  \textbf{tt-metal-specific reason:}
+  \texttt{dram\_shard\_core\_grid\_for\_k\_and\_n} picks a different
+  grid for the wider $n$. We predicted 4 cores $\to$ 8 cores $\to$
+  $\approx$2$\times$ matmul speedup.
+\end{frame}
+
+\begin{frame}[fragile]{Implementation, in one place}
+\begin{lstlisting}
+# mlp.py __init__
+self.fuse_gate_up = (not args.is_galaxy) and (prefetcher is None)
+# build w_gate_up next to w1, w3 (keeps prefill path working)
+w_fused = torch.cat([w1_3d, w3_3d], dim=-1)\
+            .reshape(args.dim, 2 * args.hidden_dim)
+
+# mlp.py forward()
+use_fused = self.fuse_gate_up and mode == Mode.DECODE
+if use_fused:
+    fused = ttnn.linear(x, self.w_gate_up, ...)
+    fused = ttnn.to_memory_config(fused, ttnn.L1_MEMORY_CONFIG)
+    w1_out = fused[..., :H]    # slice
+    w3_out = fused[..., H:]    # slice
+    # then existing ttnn.mul with activations=[SILU]
+\end{lstlisting}
+  \vfill
+  \small
+  Guarded on DECODE so prefill, Galaxy, and Llama-prefetcher paths are
+  untouched. Took two passes to get right --- prefill
+  \texttt{binary\_ng} barfed the first time.
+\end{frame}
+
+\begin{frame}{Result (on top of HiFi2)}
+  \centering
+  \small
+  \begin{tabular}{lrrr}
+    \toprule
+     & HiFi2 only & +Fusion & $\Delta$ \\
+    \midrule
+    Matmul total (ms)        & 10.45 & 10.28 & ${-}1.6\%$ \\
+    \quad calls               &  180 &   150 &  \\
+    BinaryNg (ms)            &  0.69 & \alert{0.29} & \alert{${-}58\%$} \\
+    Slice (new) + reshard    &  0.08 &  0.24 & $+0.16$ \\
+    \midrule
+    \emph{Total device (ms)} & \emph{36.75} & \alert{\emph{36.38}} & \alert{${-}1.0\%$} \\
+    \bottomrule
+  \end{tabular}
+  \vfill
+  \textbf{The matmul gain was smaller than we predicted.} The doubled core
+  grid helps, but decode batch-1 matmul is DRAM-bandwidth-bound on the
+  weight read --- more cores wait on the same DRAM bus.\\[0.5em]
+  The \emph{real} win showed up somewhere we didn't expect: the
+  downstream \texttt{binary\_ng} eltwise got 58\% cheaper because it
+  now consumes L1-interleaved instead of L1-width-sharded inputs.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\section{End-to-End}
+
+\begin{frame}{All three attempts, side by side}
+  \centering
+  \small
+  \begin{tabular}{lrr}
+    \toprule
+    Configuration                       & Total (ms) & vs.\ baseline \\
+    \midrule
+    Baseline (stock recipe)             & 41.77       & --- \\
+    $+$ MLP HiFi2                       & 36.75       & ${-}12.0\%$ \\
+    $+$ MLP gate/up fusion              & \textbf{36.38} & \textbf{${-}12.9\%$} \\
+    \midrule
+    (Failed) TopK vocab padding         & \alert{56.82} & \alert{$+36\%$} \\
+    \bottomrule
+  \end{tabular}
+  \vfill
+  \begin{itemize}
+    \item Per-iteration decode: $10.4~\text{ms} \to 9.1~\text{ms}$
+    \item Throughput (10 layers): $\sim$96 $\to$ $\sim$110 tok/s/user
+    \item 2-layer smoke test: 65 $\to$ 102.7 tok/s/user (TopK fraction
+          is larger at fewer layers, so the speedup looks bigger there)
+    \item \texttt{ci-token-matching} passes. No generation-quality regression.
+  \end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\section{Lessons}
+
+\begin{frame}{What we'd tell someone starting out}
+  \begin{enumerate}
+    \item \textbf{Profile before optimizing.} Our biggest ``fix'' turned
+          out to be against a one-core sampling op nobody was looking at.
+          Without Tracy we'd have spent the semester tuning attention.
+    \item \textbf{On \texttt{tt-metal}, shape is not dispatch.} Padding
+          inputs to look friendlier is a CUDA reflex. Here the
+          \emph{device operation} class chooses the kernel, and shape is
+          only one input to that decision.
+    \item \textbf{Expected wins are often replaced by unexpected ones.}
+          Fusion's matmul payoff was small. The payoff that actually
+          mattered was a cheaper eltwise on interleaved operands.
+          Re-profile after every change.
+    \item \textbf{Negative results are worth writing up.} Our TopK
+          padding attempt is something somebody else was eventually
+          going to try. Now they don't have to.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Future work}
+  \begin{itemize}
+    \item \textbf{Parallelize TopK.} Largest single number in the
+          profile. C++ kernel work.
+    \item \textbf{DRAM weight prefetcher for Qwen.} Exists for
+          Llama-3.1-8B. Would overlap weight fetch with compute for
+          the MLP matmuls and help the bandwidth-bound fused matmul we
+          built.
+    \item \textbf{Async AllGather $+$ matmul.} 4.8\% CCL overhead still
+          sits in the critical path. Reference implementation:
+          \texttt{experimental/ccl/llama\_all\_gather\_matmul\_async/}.
+  \end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}[standout]
+  Thank you.\\[0.5em]
+  Questions?
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\appendix
+
+\begin{frame}[fragile]{Backup: Reproducing a profile}
+\begin{lstlisting}
+cd /home/rassulmagauin/tt-metal
+source python_env/bin/activate
+export HF_MODEL=/home/rassulmagauin/models/Qwen2.5-7B-Instruct
+export TT_METAL_HOME=/home/rassulmagauin/tt-metal
+export MESH_DEVICE=P150x4
+
+python3 -m tracy -p -r \
+  -o generated/profiler/reports/<name> \
+  --check-exit-code -a device_kernel_duration -t 5000 \
+  -m 'pytest models/tt_transformers/demo/simple_text_demo.py \
+      -k "device-perf and performance" \
+      --num_layers 10 --batch_size 1 --max_seq_len 1024 \
+      --max_generated_tokens 2 --mode decode --paged_attention 1 -x'
+\end{lstlisting}
+  \vfill
+  Analyze with \texttt{tt-perf-report} on the emitted
+  \texttt{ops\_perf\_results\_*.csv}. $\sim$90~s wall time per run on a
+  warm cache.
+\end{frame}
+
+\begin{frame}{Backup: Where the code lives}
+  \small
+  Changes are on top of tt-metal commit \texttt{a4d8480d3e}. Three
+  commits, two of them shipped:
+  \vfill
+  \begin{itemize}
+    \item \texttt{965e0f4622} --- HiFi4 $\to$ HiFi2 for MLP FF1/FF2/FF3
+          in \texttt{performance\_decoder\_config.json} (all 28 layers).
+    \item \texttt{e05a044c4f} --- Gate/up projection fusion in
+          \texttt{models/tt\_transformers/tt/mlp.py}. Gated on
+          decode mode; prefill and Galaxy configs use the original
+          two-linear path.
+    \item \texttt{f6de95bb02} --- Revert of the TopK vocab padding in
+          \texttt{model\_config.py}. Kept for provenance.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Backup: Compile-cache variance}
+  Back-to-back runs of architecturally identical models showed
+  $\sim$44\% variation in matmul mean time per op, traced to
+  compile-cache state.
+  \vfill
+  For this report, all three comparison runs (Tables 2, 3, 4 of the
+  paper) were taken with warm caches inside the same shell session.
+  Deltas are stable under repeated measurement.
+  \vfill
+  Raw CSVs are under\\
+  \small
+  \texttt{generated/profiler/reports/}\\
+  \texttt{qwen25\_7b\_decode\_*/}\\
+  in the \texttt{tt-metal} working tree.
+\end{frame}
+
+\end{document}

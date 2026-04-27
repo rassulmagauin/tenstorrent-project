@@ -16,7 +16,7 @@ Per the prof's note in Slack: each student emails Prof. Mahmoud (cc Dongning) by
 
 These are drafts in markdown. Each teammate should:
 
-1. Read their own email and **edit it in their own voice** before sending. The drafts are intentionally consistent with each other on the technical facts (who did what), but every student should rephrase, cut, or add to make it sound like them. The prof asked specifically not to receive ChatGPT-generated text, so a verbatim send would defeat the point.
+1. Read their own email and **edit it in their own voice** before sending. The drafts are intentionally consistent with each other on the technical facts (who did what), but every student should rephrase, cut, or add to make it sound like them. The prof asked that emails read as the student's own writing, so a verbatim send would defeat the point.
 2. Sanity-check the attribution paragraphs about teammates — anything inaccurate, fix.
 3. Convert to plain text for email (drop the `**` markdown bold; keep paragraph breaks).
 4. Send to Prof. Mahmoud with Dongning on cc.

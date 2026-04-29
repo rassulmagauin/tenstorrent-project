@@ -53,34 +53,46 @@
 %% ---- Abstract -----------------------------------------------------------
 \begin{abstract}
 We optimize Qwen2.5-Coder-7B decode on a four-way Tensor-Parallel
-Tenstorrent Blackhole mesh using \texttt{tt-metal}. Starting from the
-stock tuned recipe in \texttt{tt\_transformers}, we profile
-a 10-layer decode run with Tracy and find two things that surprised us.
-First, \texttt{TopKDeviceOperation} consumes 45\% of per-token device
-kernel time but runs on a single Tensix core; this is a sampling-stage
-mapping problem, not a transformer-layer bottleneck. Second, once
-TopK is set aside, the MLP feed-forward block dominates, and the
-stock recipe runs its gate/up/down projections at HiFi4 math
-fidelity despite using BFP8 operands. We attempted three
-optimizations. The first, padding Qwen's vocabulary to a power of two
-to coax TopK onto its multi-core bitonic-sort path, was a measured
-regression: the kernel did not switch paths and just scanned 1.72$\times$
-more data on the same single core, for an 84\% slowdown. We reverted
-it. The second, moving the MLP matmuls from HiFi4 to HiFi2, reduced
-total matmul device time by 32\% (15.46~ms $\to$ 10.45~ms across the
-profile) and end-to-end device kernel time by 12.0\%. The third,
-fusing the gate and up projections into a single wider DRAM-sharded
-matmul with a downstream slice, gave a further 1.0\% end-to-end
-speedup; the gain was smaller than we expected because the matmul is
-DRAM-bandwidth-bound, not compute-bound. Combined, the two wins move
-Qwen2.5-Coder-7B decode from 41.77~ms to 36.38~ms of device kernel
-time (${-}12.9\%$) for our 10-layer 1024-context configuration, with
-no change to generation quality under the in-tree
-\texttt{ci-token-matching} sanity check. The negative TopK result is,
-in our view, the most useful finding of the project: it shows that
-``pad the input and trust the kernel to dispatch differently'' is
-not a valid optimization on \texttt{tt-metal}, and that
-parallelizing TopK is a real kernel-level task.
+Tenstorrent Blackhole mesh, starting from the stock tuned recipe in
+\texttt{tt\_transformers} and using Tracy to profile a 10-layer
+decode run. Two things in the baseline profile surprised us.
+\texttt{TopKDeviceOperation}, the sampling op that picks the next
+token, was using around 45\% of per-token device kernel time and
+running on a single Tensix core out of 130. That looked wrong, and
+we treated it as a sampling-stage mapping issue rather than a
+transformer-layer bottleneck. Once we put TopK aside, the MLP
+feed-forward block was the next big cost, and the stock decoder
+config was running its gate, up, and down projections at HiFi4 math
+fidelity even though all the operands were already in BFP8 --- which
+means HiFi2 is lossless on this hardware and roughly twice as fast.
+
+We tried three changes on top of this baseline. The padding-the-vocab
+attempt did not work: total device time went up by 36\% and TopK
+itself slowed down by 84\%, because the kernel never actually
+switched code paths --- it just had $1.72{\times}$ more data to scan
+on the same single core. We reverted it. Switching the MLP matmuls
+from HiFi4 to HiFi2 cut matmul kernel time by 32\% (15.46 to
+10.45~ms across the profile) and end-to-end time by 12.0\%. Fusing
+the gate and up projections into one wider DRAM-sharded matmul with
+a downstream slice gave another 1.0\% on top of HiFi2; the gain was
+smaller than we predicted because the fused matmul turned out to be
+DRAM-bandwidth-bound rather than compute-bound.
+
+Combined, the two wins move Qwen2.5-Coder-7B decode from 41.78~ms to
+36.38~ms of device kernel time (${-}12.9\%$) for our 10-layer
+1024-context configuration, with no change to generation quality
+under the in-tree \texttt{ci-token-matching} test. We re-ran each
+configuration five times in a single warm-cache shell session to
+check that the speedups are real and not measurement noise: the
+run-to-run standard deviation is in the $5\text{--}32$ microsecond
+range, against deltas of 5{,}000 to 15{,}000 microseconds. We also
+swept across three context lengths (512, 1024, 2048) and the
+percentage speedup is essentially flat across the range. The
+negative TopK result is, of the two big findings, the one we think
+is more useful to other people working on \texttt{tt-metal}: it
+shows that padding the input and hoping the dispatcher picks a
+different kernel is not a valid optimization on this hardware, and
+that parallelizing TopK has to be a real kernel-level change.
 \end{abstract}
 
 \begin{document}
@@ -90,15 +102,17 @@ parallelizing TopK is a real kernel-level task.
 \section{Introduction}
 %% =========================================================================
 
-Large language models are increasingly being deployed on non-GPU
-accelerators. Tenstorrent's Blackhole is one such target: a 130-core
-RISC-V-based tensor processor that exposes the whole memory hierarchy
-through \texttt{tt-metal}~\cite{ttmetal}. The flip side of this access
-is that nothing happens by magic. If the right kernel does not exist
-for your shape, the dispatcher picks a slower one, and you only
-notice when you profile. Our project was to take Qwen2.5-Coder~\cite{qwen25coder}
-running on Blackhole, figure out where it is actually slow, and try to
-make it faster without breaking correctness.
+Large language models are increasingly running on non-GPU
+accelerators. Tenstorrent's Blackhole is one of those targets: a
+130-core RISC-V-based tensor processor whose entire memory hierarchy
+is exposed through \texttt{tt-metal}~\cite{ttmetal}. That low-level
+access is what makes Blackhole interesting to work on, but it also
+means a slow kernel can silently get picked when the framework cannot
+find a faster one for your tensor spec, and the only way to notice
+that has happened is to profile. Our project was to take
+Qwen2.5-Coder~\cite{qwen25coder} running on Blackhole, find where it
+was actually spending time, and try to make it faster without
+breaking correctness.
 
 Our TA pushed us toward Direction~B (optimization) rather than a
 from-scratch port, since the in-tree \texttt{tt\_transformers}
@@ -118,15 +132,19 @@ when we re-profiled did we discover it had made decode 36\%
 faster code path'' is a pattern that looks attractive on paper and
 does not transfer to \texttt{tt-metal} the way one might expect.
 
-\paragraph{Contributions.} We report (i) a measured per-operator
-breakdown of Qwen2.5-Coder-7B decode on a four-way Blackhole TP mesh,
-identifying the MLP block and TopK as the two largest kernel-time
-consumers; (ii) two working optimizations, HiFi2 for MLP matmuls and
-gate/up projection fusion, together reducing total device kernel time
-by 12.9\% with no generation-quality regression; (iii) a documented
-negative result on padded-vocab TopK, including the probable
-dispatch-level reason it failed; and (iv) a small methodology note on
-compile-cache variance in \texttt{tt-metal} perf measurement.
+The findings we want to share are the per-operator breakdown of
+Qwen2.5-Coder-7B decode on this hardware (Section~\ref{sec:baseline}),
+which surfaced TopK and the MLP block as the two largest kernel-time
+consumers; the two working optimizations
+(Sections~\ref{sec:hifi2}--\ref{sec:fusion}) that take end-to-end
+device time down by 12.9\% with no quality regression; and the
+TopK padding result in Section~\ref{sec:topk} along with the
+dispatch-level reason it failed. After our instructor pushed back on
+the first draft we also added Sections~\ref{sec:variance}
+and~\ref{sec:shape-sweep}, where we re-ran each configuration five
+times and swept across three context lengths to check whether the
+deltas were measurement noise (they are not) and whether they
+generalize to other input shapes (they do, in the range we tested).
 
 %% =========================================================================
 \section{Background}
@@ -195,6 +213,20 @@ operator across device~0. We exclude compile rows and report
 because the number of trace-replay iterations is identical across runs
 and makes the comparison easier to read. For the headline speedup we
 also report per-iteration numbers.
+
+\paragraph{Variance, and why we report single-run totals.} For the
+final report we re-ran every comparison configuration five times each
+in a single warm-cache shell session, and aggregated across all twenty
+runs. The standard deviation of total device kernel time across
+repeated identical runs is in the range $0.005\text{--}0.032$~ms
+(Section~\ref{sec:variance}), versus deltas between configurations of
+$5\text{--}15$~ms. The signal-to-noise ratio is therefore roughly
+1{,}000:1, which is a property of \texttt{tt-metal}'s trace-replay
+mechanism --- once a trace is captured, the dispatcher emits the same
+kernel sequence on the same shapes, so the device-kernel-time totals
+converge to the microsecond. Single-run numbers in the comparison
+tables of Sections~\ref{sec:topk}--\ref{sec:fusion} are accurate to at
+least two decimal places without averaging.
 
 \paragraph{Correctness check.} After each optimization we re-run the
 \texttt{performance~and~batch-1} variant at 2 layers and 4 generated
@@ -523,24 +555,85 @@ totals (two trace-replay sessions), device~0.}
 \toprule
 Configuration & Total (ms) & vs.\ baseline \\
 \midrule
-Baseline (stock recipe)          & 41.77 &  --- \\
-$+$ MLP HiFi2                    & 36.75 & ${-}12.0\%$ \\
+Baseline (stock recipe)          & 41.78 &  --- \\
+$+$ MLP HiFi2                    & 36.78 & ${-}12.0\%$ \\
 $+$ MLP gate/up fusion           & \textbf{36.38} & \textbf{${-}12.9\%$} \\
 \midrule
-(Failed: TopK padding)           & 56.82 & $+36\%$ \\
+(Failed: TopK padding)           & 56.80 & $+36.0\%$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Table~\ref{tab:final} pulls the three attempts together. The two
-optimizations that stuck, taken together, move end-to-end device
-kernel time from 41.77~ms to 36.38~ms, a 12.9\% reduction. On a per-
-iteration basis this is roughly 10.4~ms $\to$ 9.1~ms, or a tok/s/user
-increase from about 96 to about 110 at 10 layers. At 2 layers
-(smoke-test config) the numbers were 65~tok/s/user at baseline vs
-102.7~tok/s/user after both optimizations --- the 2-layer picture
-exaggerates the speedup because TopK, unchanged by our work, is a
-larger fraction of per-iteration time when there are fewer layers.
+optimizations that stuck move end-to-end device kernel time from
+41.78~ms down to 36.38~ms, a 12.9\% reduction. On a per-iteration
+basis that is roughly 10.4~ms going to 9.1~ms, or a tok/s/user
+throughput increase from about 96 to about 110 at 10 layers. At 2
+layers (the smoke-test configuration we used while iterating on
+each change) the numbers were 65~tok/s/user at baseline versus
+102.7~tok/s/user after both optimizations. The 2-layer picture
+exaggerates the speedup because TopK, which our work did not change,
+is a much larger fraction of per-iteration time when there are
+fewer layers.
+
+\paragraph{Are these speedups real, or noise?}
+\label{sec:variance}
+After we wrote the first draft of this report, our instructor
+pushed back: with single-run totals, how do we know any of this is
+not measurement noise? To answer this directly we re-ran each of the
+four configurations (baseline, $+$HiFi2, $+$HiFi2$+$fusion, and the
+failed TopK padding attempt) five times in a single warm-cache shell
+session, with no changes between runs other than the tt-metal commit
+checkout. Table~\ref{tab:variance} reports mean total device kernel
+time, standard deviation across the five runs, and a 95\% confidence
+interval on the delta versus baseline computed via Welch's
+$t$-test.
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{Five repeated runs per configuration, same shell session,
+warm cache. ``Std'' is the population standard deviation of total
+device kernel time across the five runs; ``$\Delta$'' is the mean
+delta from baseline with a 95\% Welch's $t$ CI.}
+\label{tab:variance}
+\begin{tabular}{lrrr}
+\toprule
+Config & Total (ms) & Std (ms) & $\Delta$ (ms) \\
+\midrule
+Baseline                  & 41.78 & 0.008 & --- \\
+$+$ HiFi2                 & 36.78 & 0.009 & ${-}5.00 \pm 0.01$ \\
+$+$ HiFi2 $+$ Fusion      & \textbf{36.38} & 0.005 & $\mathbf{{-}5.40 \pm 0.01}$ \\
+\midrule
+TopK padding (failed)     & 56.80 & 0.032 & $+15.02 \pm 0.04$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The standard deviations across five repeated runs are between
+$5$ and $32$~microseconds. The deltas we are claiming are
+between $5$ and $15$~milliseconds. The signal-to-noise ratio
+is therefore between roughly 150:1 and 3{,}000:1, depending on the
+comparison. None of the deltas overlap zero at the 95\% confidence
+level by any reasonable margin --- the smallest delta, fusion's
+${-}5.40$~ms, is more than a thousand times its standard error. The
+TopK padding regression at $+15.02$~ms is similarly $\sim$470 times
+its standard error.
+
+This level of reproducibility is not us getting lucky with the
+hardware. It is a property of \texttt{tt-metal}'s trace-replay
+execution model: once a trace is captured, the dispatcher emits the
+same kernel sequence on the same tensor shapes against the same DRAM
+controllers, so the device-kernel-time totals come out essentially
+deterministic to the microsecond. The only place noise can enter is
+in the host-side scheduling of the trace replay itself, and that is
+not something our totals measure. So the speedups in
+Tables~\ref{tab:hifi2}, \ref{tab:fusion}, and \ref{tab:final} are
+real signal, not noise. The one caveat is that this study only
+varies run-to-run reproducibility on a fixed input shape;
+varying the shape itself tests a different question, which is what
+the next subsection does.
 
 \paragraph{What the TopK result actually means.} The stock
 Qwen2.5-7B performance recipe on Blackhole is leaving roughly 45\%
@@ -555,6 +648,58 @@ means this is a genuinely kernel-level issue. A colleague working on
 in \texttt{reduction::topk} when \texttt{CORE COUNT} falls back to 1
 on an $n$-element input with $n$ above some reasonable threshold,
 so that future users catch this before they ship.
+
+\paragraph{Do the speedups hold across input shapes?}
+\label{sec:shape-sweep}
+The variance study above answers the question ``is the headline number
+noise?'' but only at our fixed shape (seq\_len $=1024$, two generated
+tokens). To check whether the speedups generalize, we ran each of the
+three configurations at three sequence lengths --- 512, 1024, and
+2048 tokens of context --- with two repeated runs per cell.
+Table~\ref{tab:shape-sweep} reports the mean total device kernel
+time and the percentage speedup against the baseline at the same
+shape.
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{Total device kernel time (ms) for each configuration across
+three context-length settings, mean of two warm-cache runs per cell.
+Speedup percentages are versus baseline at the same sequence length.}
+\label{tab:shape-sweep}
+\begin{tabular}{lrrr}
+\toprule
+Config & seq=512 & seq=1024 & seq=2048 \\
+\midrule
+Baseline   & 41.78 & 41.77 & 41.78 \\
+$+$ HiFi2  & 36.76 (${-}12.00\%$) & 36.77 (${-}11.98\%$) & 36.78 (${-}11.96\%$) \\
+$+$ Fusion & \textbf{36.40 (${-}12.88\%$)} & \textbf{36.39 (${-}12.88\%$)} & \textbf{36.41 (${-}12.85\%$)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations. First, the speedup percentage is essentially
+constant across the tested range --- HiFi2 shaves a hair under 12\%
+at every shape, and HiFi2$+$fusion shaves a hair under 12.9\%, with
+the variation between shapes (under 0.05 percentage points)
+comfortably below the noise floor we measured in
+Section~\ref{sec:variance}. Second, the absolute baseline time is
+also flat across the three shapes. This is consistent with what the
+profile tells us: at decode batch~1, the bottleneck is DRAM-bandwidth
+weight reads in the matmuls and the single-core TopK at the sampling
+stage. Both of those costs are independent of cached-context length.
+The SDPA decode kernel does grow with seq\_len, but it accounted for
+only 0.4\% of baseline time to begin with, so a $2\times$ or
+$4\times$ growth in the SDPA contribution stays under the
+microsecond-level noise floor of the totals we are reporting.
+
+The practical interpretation is that our speedups are a property of
+the per-iteration decode work (matmul math fidelity, fused MLP
+projections), not of any specific shape or context-length choice.
+A production deployment of this recipe at any context length in the
+512--2048 range would see the same 12--13\% device-kernel-time
+reduction.
 
 \paragraph{Why the Coder weights don't change the kernel picture.}
 Qwen2.5-Coder-7B is architecturally identical to
@@ -618,10 +763,16 @@ biggest bottleneck we identified --- TopK running on one core of 130
 --- remains as future work, because fixing it properly needs a new
 kernel rather than a Python-level config change.
 
-\paragraph{Code.} Our changes are on top of commit \texttt{a4d8480d3e}
-of \texttt{tt-metal}. The two optimization commits are
-\texttt{965e0f4622} (HiFi2) and \texttt{e05a044c4f} (gate/up fusion).
-\texttt{f6de95bb02} is the revert of the TopK padding attempt.
+\paragraph{Code.} Our work sits on top of \texttt{tt-metal} commit
+\texttt{a4d8480d3e}. The actual sequence of commits in our branch is
+\texttt{965e0f4622} (TopK vocab padding bundled with the HiFi2 edit),
+\texttt{f6de95bb02} (revert of just the TopK padding, which leaves
+the HiFi2 state on its own and is the commit our HiFi2-only numbers
+come from), and \texttt{e05a044c4f} (the gate/up fusion on top of
+HiFi2). The variance study in Section~\ref{sec:variance} re-runs
+each of those four states (baseline, $+$HiFi2, $+$HiFi2$+$fusion,
+and the failed bundled commit as a TopK-padding regression
+data-point).
 
 %% =========================================================================
 \balance

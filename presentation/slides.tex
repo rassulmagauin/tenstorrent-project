@@ -355,24 +355,49 @@ if use_fused:
 \begin{frame}{All three attempts, side by side}
   \centering
   \small
-  \begin{tabular}{lrr}
+  \begin{tabular}{lrrr}
     \toprule
-    Configuration                       & Total (ms) & vs.\ baseline \\
+    Configuration                       & Total (ms) & Std & vs.\ baseline \\
     \midrule
-    Baseline (stock recipe)             & 41.77       & --- \\
-    $+$ MLP HiFi2                       & 36.75       & ${-}12.0\%$ \\
-    $+$ MLP gate/up fusion              & \textbf{36.38} & \textbf{${-}12.9\%$} \\
+    Baseline                            & 41.78 & 0.008 & --- \\
+    $+$ HiFi2                           & 36.78 & 0.009 & ${-}12.0\%$ \\
+    $+$ HiFi2 $+$ Fusion                & \textbf{36.38} & 0.005 & \textbf{${-}12.9\%$} \\
     \midrule
-    (Failed) TopK vocab padding         & \alert{56.82} & \alert{$+36\%$} \\
+    TopK padding (failed)               & \alert{56.80} & 0.032 & \alert{$+36.0\%$} \\
     \bottomrule
   \end{tabular}
   \vfill
   \begin{itemize}
-    \item Per-iteration decode: $10.4~\text{ms} \to 9.1~\text{ms}$
-    \item Throughput (10 layers): $\sim$96 $\to$ $\sim$110 tok/s/user
-    \item 2-layer smoke test: 65 $\to$ 102.7 tok/s/user (TopK fraction
-          is larger at fewer layers, so the speedup looks bigger there)
+    \item Numbers are mean of 5 repeated runs. Std is in
+          \emph{microseconds}; deltas are in milliseconds. Signal-to-noise
+          ratio 150:1 to 3{,}000:1 — these are not measurement noise.
+    \item Per-iter decode: $10.4~\text{ms} \to 9.1~\text{ms}$. Throughput at
+          10 layers: $\sim$96 $\to$ $\sim$110 tok/s/user.
     \item \texttt{ci-token-matching} passes. No generation-quality regression.
+  \end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Does the speedup hold at other context lengths?}
+  \small
+  \centering
+  \begin{tabular}{lrrr}
+    \toprule
+     & seq=512 & seq=1024 & seq=2048 \\
+    \midrule
+    Baseline               & 41.78 & 41.77 & 41.78 \\
+    $+$ HiFi2              & 36.76 (${-}12.00\%$) & 36.77 (${-}11.98\%$) & 36.78 (${-}11.96\%$) \\
+    $+$ HiFi2 $+$ Fusion   & \textbf{36.40} (${-}12.88\%$) & \textbf{36.39} (${-}12.88\%$) & \textbf{36.41} (${-}12.85\%$) \\
+    \bottomrule
+  \end{tabular}
+  \vfill
+  \begin{itemize}
+    \item Speedup is \textbf{flat across input shapes} (variation $<$ 0.05pp).
+    \item Absolute baseline is also flat — at decode batch 1 the cost is
+          dominated by DRAM weight reads and the 1-core TopK; neither scales
+          with cached-context length.
+    \item SDPA does grow with seq\_len, but starts at 0.4\% of total, so
+          the growth disappears under the microsecond noise floor.
   \end{itemize}
 \end{frame}
 

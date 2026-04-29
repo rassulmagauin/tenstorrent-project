@@ -1,0 +1,7 @@
+config=hifi2
+tt_metal_commit=f6de95bb0258675c6bba64a77b4acaf7da050348
+seq_lens=512 1024 2048
+runs_per_shape=2
+host=tt-blackhole-02
+started=2026-04-29T18:46:25+04:00
+ended=2026-04-29T18:50:02+04:00

@@ -22,3 +22,10 @@
 .claude/
 .vscode/
 .idea/
+
+# Raw Tracy outputs from variance / shape-sweep runs are too big for git.
+# We keep only the summaries and per-config manifest.
+variance_results/*/run_*/
+variance_results/*/seq*/
+shape_sweep_results/*/run_*/
+shape_sweep_results/*/seq*/

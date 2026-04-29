@@ -1,0 +1,7 @@
+config=fusion
+tt_metal_commit=e05a044c4f073305017fc6202748f73e077a878b
+seq_lens=512 1024 2048
+runs_per_shape=2
+host=tt-blackhole-02
+started=2026-04-29T18:50:02+04:00
+ended=2026-04-29T18:53:51+04:00

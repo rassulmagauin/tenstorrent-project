@@ -1,0 +1,16 @@
+\begin{table}[h]
+\centering
+\small
+\caption{End-to-end device kernel time, mean $\pm$ std across 5 repeated runs per config. 95\% CI on $\Delta$ from Welch's $t$-test.}
+\label{tab:variance}
+\begin{tabular}{lrr}
+\toprule
+Config & Total (ms) & $\Delta$ vs.\ baseline (ms, 95\% CI) \\
+\midrule
+baseline & 41.78 $\pm$ 0.01 & --- \\
+hifi2 & 36.78 $\pm$ 0.01 & -5.00 $\pm$ 0.01 \\
+fusion & 36.38 $\pm$ 0.00 & -5.40 $\pm$ 0.01 \\
+topk_padding & 56.80 $\pm$ 0.03 & +15.02 $\pm$ 0.04 \\
+\bottomrule
+\end{tabular}
+\end{table}

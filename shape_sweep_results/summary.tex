@@ -1,0 +1,15 @@
+\begin{table}[h]
+\centering
+\small
+\caption{Total device kernel time (ms) across input shapes, mean of N runs per cell. Speedup percentages are versus the baseline at the same sequence length.}
+\label{tab:shape-sweep}
+\begin{tabular}{lrrr}
+\toprule
+Config & seq=512 & seq=1024 & seq=2048 \\
+\midrule
+baseline & 41.78 & 41.77 & 41.78 \\
+hifi2 & 36.76 (-12.0\%) & 36.77 (-12.0\%) & 36.78 (-12.0\%) \\
+fusion & 36.40 (-12.9\%) & 36.39 (-12.9\%) & 36.41 (-12.9\%) \\
+\bottomrule
+\end{tabular}
+\end{table}

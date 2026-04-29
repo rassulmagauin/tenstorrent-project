@@ -1,0 +1,7 @@
+config=baseline
+tt_metal_commit=a4d8480d3e7f1b1c515b6f767f7f75aad16fd7de
+seq_lens=512 1024 2048
+runs_per_shape=2
+host=tt-blackhole-02
+started=2026-04-29T18:42:49+04:00
+ended=2026-04-29T18:46:25+04:00
